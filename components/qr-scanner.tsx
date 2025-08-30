@@ -32,29 +32,34 @@ export function QRScanner({ onScanned, onError }: QRScannerProps) {
     }
   }, [])
 
-  // List cameras (labels may be blank until permission granted)
-  useEffect(() => {
-    async function list() {
-      try {
-        const all = await navigator.mediaDevices.enumerateDevices()
-        const vids = all.filter((d): d is VideoDevice => d.kind === "videoinput")
-        setDevices(vids)
-        // Prefer a back camera by default if any looks like it
-        if (selectedDeviceId === "auto") {
-          const back = vids.find(
-            (d) =>
-              /back|rear|environment/i.test(d.label) ||
-              /facing back/i.test(d.label) ||
-              /truedepth/i.test(d.label) === false,
-          )
-          if (back?.deviceId) setSelectedDeviceId(back.deviceId)
-        }
-      } catch (e) {
-        console.log("[v0] enumerateDevices error:", e)
-      }
+  const enumerateVideoInputs = useCallback(async () => {
+    try {
+      const all = await navigator.mediaDevices.enumerateDevices()
+      const vids = all.filter((d): d is VideoDevice => d.kind === "videoinput")
+      setDevices(vids)
+      return vids
+    } catch (e) {
+      console.log("[v0] enumerateDevices error:", e)
+      return []
     }
-    list()
-  }, [selectedDeviceId])
+  }, [])
+
+  const findBackCameraId = useCallback(
+    async (vids?: VideoDevice[]) => {
+      const list = vids ?? (await enumerateVideoInputs())
+      const back = list.find(
+        (d) =>
+          /back|rear|environment/i.test(d.label) ||
+          (/facing back/i.test(d.label) && !/front|true depth|truedepth/i.test(d.label)),
+      )
+      if (back?.deviceId) return back.deviceId
+
+      if (list.length > 1) return list[list.length - 1]?.deviceId
+
+      return list[0]?.deviceId
+    },
+    [enumerateVideoInputs],
+  )
 
   const humanizeError = (err: any) => {
     const name = err?.name || ""
@@ -86,7 +91,6 @@ export function QRScanner({ onScanned, onError }: QRScannerProps) {
 
   useEffect(() => {
     return () => {
-      // Cleanup on unmount
       stopCamera()
     }
   }, [stopCamera])
@@ -111,7 +115,6 @@ export function QRScanner({ onScanned, onError }: QRScannerProps) {
         return
       }
 
-      // Resize canvas to video frame
       if (canvas.width !== w) canvas.width = w
       if (canvas.height !== h) canvas.height = h
 
@@ -125,7 +128,6 @@ export function QRScanner({ onScanned, onError }: QRScannerProps) {
         } catch (e) {
           console.log("[v0] onScanned handler error:", e)
         }
-        // Stop after successful scan
         setStarted(false)
         stopCamera()
         return
@@ -136,26 +138,12 @@ export function QRScanner({ onScanned, onError }: QRScannerProps) {
     rafRef.current = requestAnimationFrame(tick)
   }, [onScanned, stopCamera])
 
-  const startCamera = useCallback(async () => {
-    setErrMsg(null)
-    // Prefer selected device; fallback to environment; then user
-    const constraints: MediaStreamConstraints = {
-      video:
-        selectedDeviceId && selectedDeviceId !== "auto"
-          ? { deviceId: { exact: selectedDeviceId } }
-          : { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
-      audio: false,
-    }
-
-    try {
-      console.log("[v0] getUserMedia constraints:", constraints)
-      const stream = await navigator.mediaDevices.getUserMedia(constraints)
+  const startWithStream = useCallback(
+    async (stream: MediaStream) => {
       streamRef.current = stream
-
       const video = videoRef.current
       if (!video) return
       video.srcObject = stream
-      // Required for iOS Safari
       video.setAttribute("playsinline", "true")
       video.muted = true
 
@@ -165,6 +153,79 @@ export function QRScanner({ onScanned, onError }: QRScannerProps) {
 
       setStarted(true)
       decodeLoop()
+    },
+    [decodeLoop],
+  )
+
+  const tryGetUserMedia = useCallback(async (constraints: MediaStreamConstraints) => {
+    console.log("[v0] getUserMedia try with constraints:", JSON.stringify(constraints))
+    return navigator.mediaDevices.getUserMedia(constraints)
+  }, [])
+
+  const startCamera = useCallback(async () => {
+    setErrMsg(null)
+    try {
+      stopCamera()
+
+      try {
+        const stream = await tryGetUserMedia({
+          video: {
+            facingMode: { exact: "environment" as any },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+          audio: false,
+        })
+        console.log("[v0] using facingMode exact environment")
+        await startWithStream(stream)
+        return
+      } catch (err: any) {
+        console.log("[v0] exact environment failed:", err?.name || err)
+        if (err?.name === "NotAllowedError" || err?.name === "SecurityError") {
+          throw err
+        }
+      }
+
+      try {
+        const stream = await tryGetUserMedia({
+          video: {
+            facingMode: { ideal: "environment" as any },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+          audio: false,
+        })
+        console.log("[v0] using facingMode ideal environment")
+        await startWithStream(stream)
+        return
+      } catch (err: any) {
+        console.log("[v0] ideal environment failed:", err?.name || err)
+        if (err?.name === "NotAllowedError" || err?.name === "SecurityError") {
+          throw err
+        }
+      }
+
+      console.log("[v0] preflight getUserMedia(video:true)")
+      const preflight = await tryGetUserMedia({ video: true, audio: false })
+      for (const t of preflight.getTracks()) t.stop()
+
+      const vids = await enumerateVideoInputs()
+      const backId = await findBackCameraId(vids)
+      if (!backId) {
+        console.log("[v0] no back camera found, fallback to generic camera")
+        const stream = await tryGetUserMedia({ video: true, audio: false })
+        await startWithStream(stream)
+        return
+      }
+
+      console.log("[v0] starting with back camera deviceId:", backId)
+      setSelectedDeviceId(backId)
+      const stream = await tryGetUserMedia({
+        video: { deviceId: { exact: backId } },
+        audio: false,
+      })
+      await startWithStream(stream)
+      return
     } catch (e: any) {
       console.log("[v0] getUserMedia error:", e)
       const msg = humanizeError(e)
@@ -173,7 +234,7 @@ export function QRScanner({ onScanned, onError }: QRScannerProps) {
       stopCamera()
       onError?.(e)
     }
-  }, [decodeLoop, onError, selectedDeviceId, stopCamera])
+  }, [enumerateVideoInputs, findBackCameraId, onError, startWithStream, stopCamera, tryGetUserMedia])
 
   const handleUpload = useCallback(
     async (file: File) => {
@@ -219,20 +280,7 @@ export function QRScanner({ onScanned, onError }: QRScannerProps) {
       {!started ? (
         <div className="flex flex-col gap-3">
           <div className="text-sm text-muted-foreground">
-            Camera access is required to scan a QR. Start the camera or upload an image instead.
-          </div>
-
-          {/* Camera selector (when available) */}
-          <div className="flex items-center gap-2">
-            <label className="text-xs text-muted-foreground">Camera</label>
-            <select
-              className="rounded-md border bg-background px-2 py-1 text-sm"
-              value={selectedDeviceId}
-              onChange={(e) => setSelectedDeviceId(e.target.value)}
-            >
-              <option value="auto">Auto (Back if available)</option>
-              {deviceOptions}
-            </select>
+            Camera access is required to scan a QR. We’ll try to use the back camera.
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -243,7 +291,7 @@ export function QRScanner({ onScanned, onError }: QRScannerProps) {
               }}
               className="inline-flex items-center justify-center rounded-md border bg-background px-3 py-2 text-sm font-medium hover:bg-accent"
             >
-              Start camera
+              Start Back Camera
             </button>
 
             <label className="inline-flex cursor-pointer items-center justify-center rounded-md border bg-background px-3 py-2 text-sm font-medium hover:bg-accent">
@@ -275,9 +323,7 @@ export function QRScanner({ onScanned, onError }: QRScannerProps) {
       ) : (
         <div className="flex flex-col gap-2">
           <div className="overflow-hidden rounded-md">
-            {/* Visible video preview */}
             <video ref={videoRef} className="h-64 w-full bg-black object-contain" />
-            {/* Offscreen canvas for decoding */}
             <canvas ref={canvasRef} className="hidden" />
           </div>
 
